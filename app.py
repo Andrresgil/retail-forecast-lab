@@ -2,7 +2,9 @@
 
 from pathlib import Path
 
+import altair as alt
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -10,6 +12,7 @@ import streamlit as st
 BASE = Path(__file__).resolve().parent
 RUTA_MODELO = BASE / "modelos" / "regresion_lineal.joblib"
 RUTA_HISTORIAL = BASE / "data" / "historial_reciente.csv"
+RUTA_PUNTOS = BASE / "data" / "puntos_grafica.csv"
 
 
 @st.cache_resource
@@ -22,6 +25,12 @@ def cargar_modelo():
 def cargar_historial():
     """Carga los últimos cuatro valores observados de cada producto."""
     return pd.read_csv(RUTA_HISTORIAL, dtype={"StockCode": "string"})
+
+
+@st.cache_data
+def cargar_puntos():
+    """Carga ejemplos usados para dibujar la nube de puntos."""
+    return pd.read_csv(RUTA_PUNTOS)
 
 
 def pronosticar(modelo_guardado, ventas):
@@ -47,6 +56,7 @@ st.write(
 try:
     modelo_guardado = cargar_modelo()
     historial = cargar_historial()
+    puntos = cargar_puntos()
 except (FileNotFoundError, OSError) as error:
     st.error(f"Falta un archivo necesario para iniciar la aplicación: {error}")
     st.stop()
@@ -72,7 +82,7 @@ fila = historial.loc[historial["StockCode"] == codigo].iloc[0]
 st.info(
     "El código del producto solo carga valores de ejemplo. "
     "El modelo calcula la predicción usando las **cuatro ventas semanales**, "
-    "que puedes modificar abajo."
+    "que puedes modificar abajo. La gráfica y el pronóstico cambian al ajustar los controles."
 )
 st.caption(f"Ejemplo histórico: últimas semanas completas hasta {fila['SemanaUltima']}.")
 
@@ -83,11 +93,21 @@ etiquetas_semanas = {
     1: "Hace 2 semanas",
     0: "Última semana",
 }
-with st.form(key=f"pronostico_{codigo}"):
-    columnas = st.columns(4)
-    for indice, columna in zip((3, 2, 1, 0), columnas):
-        variable = f"ventas_t_{indice}"
-        with columna:
+columnas = st.columns(4)
+rango_slider = max(500, 2 * max(int(fila[f"ventas_t_{i}"]) for i in range(4)))
+for indice, columna in zip((3, 2, 1, 0), columnas):
+    variable = f"ventas_t_{indice}"
+    with columna:
+        if indice == 0:
+            ventas[variable] = st.slider(
+                etiquetas_semanas[indice],
+                min_value=0,
+                max_value=rango_slider,
+                value=int(fila[variable]),
+                step=1,
+                key=f"{codigo}_{variable}",
+            )
+        else:
             ventas[variable] = st.number_input(
                 etiquetas_semanas[indice],
                 min_value=0,
@@ -95,32 +115,78 @@ with st.form(key=f"pronostico_{codigo}"):
                 step=1,
                 key=f"{codigo}_{variable}",
             )
-    calcular = st.form_submit_button("Calcular pronóstico", type="primary")
 
-if calcular:
-    estimacion = pronosticar(modelo_guardado, ventas)
-    unidades = round(estimacion)
-    st.metric("Unidades estimadas para la semana siguiente", f"{unidades:,}".replace(",", "."))
+estimacion = pronosticar(modelo_guardado, ventas)
+unidades = round(estimacion)
+st.metric("Unidades estimadas para la semana siguiente", f"{unidades:,}".replace(",", "."))
 
-    grafico = pd.DataFrame(
-        {
-            "Semana": [
-                "Hace 4 semanas", "Hace 3 semanas", "Hace 2 semanas",
-                "Última semana", "Semana siguiente",
-            ],
-            "Ventas registradas": [
-                ventas["ventas_t_3"], ventas["ventas_t_2"],
-                ventas["ventas_t_1"], ventas["ventas_t_0"], None,
-            ],
-            "Pronóstico": [None, None, None, None, unidades],
-        }
-    )
-    st.subheader("Ventas recientes y pronóstico")
-    st.bar_chart(grafico.set_index("Semana"))
-    st.caption(
-        "Es una estimación de ventas registradas, no una garantía. "
-        "El modelo no conoce precios futuros, promociones ni faltantes de inventario."
-    )
+st.subheader("Cómo responde la regresión lineal")
+st.caption(
+    "Azul: ejemplos históricos. Rojo: predicción del modelo al variar la última semana "
+    "y mantener fijas las otras tres. Naranja: tu pronóstico actual. "
+    "Mueve el control de la última semana para ver cómo cambia."
+)
+
+# Una regresión con cuatro entradas no cabe completa en un plano.
+# Para dibujar una recta, variamos una entrada y fijamos las otras tres.
+limite_x = max(1000, int(ventas["ventas_t_0"] * 1.2))
+valores_x = np.linspace(0, limite_x, 120)
+entradas_recta = pd.DataFrame(
+    [{**ventas, "ventas_t_0": valor} for valor in valores_x],
+    columns=modelo_guardado["variables"],
+)
+valores_y = np.clip(modelo_guardado["modelo"].predict(entradas_recta), 0, None)
+recta = pd.DataFrame({"ventas_t_0": valores_x, "prediccion": valores_y})
+limite_y = max(1000, int(max(float(valores_y.max()), estimacion) * 1.2))
+puntos_visibles = puntos.loc[
+    (puntos["ventas_t_0"] <= limite_x)
+    & (puntos["unidades_siguiente_semana"] <= limite_y)
+]
+
+eje_x = alt.X("ventas_t_0:Q", title="Ventas de la última semana", scale=alt.Scale(domain=[0, limite_x]))
+nube = alt.Chart(puntos_visibles).mark_circle(size=24, opacity=0.18, color="#60a5fa").encode(
+    x=eje_x,
+    y=alt.Y(
+        "unidades_siguiente_semana:Q",
+        title="Ventas de la semana siguiente",
+        scale=alt.Scale(domain=[0, limite_y]),
+    ),
+)
+linea = alt.Chart(recta).mark_line(color="#ef4444", strokeWidth=3).encode(
+    x=eje_x,
+    y=alt.Y("prediccion:Q", scale=alt.Scale(domain=[0, limite_y])),
+)
+punto_actual = alt.Chart(
+    pd.DataFrame({"ventas_t_0": [ventas["ventas_t_0"]], "prediccion": [estimacion]})
+).mark_circle(size=220, color="#f59e0b", stroke="white", strokeWidth=2).encode(
+    x=eje_x,
+    y=alt.Y("prediccion:Q", scale=alt.Scale(domain=[0, limite_y])),
+    tooltip=[
+        alt.Tooltip("ventas_t_0:Q", title="Última semana", format=".0f"),
+        alt.Tooltip("prediccion:Q", title="Pronóstico", format=".1f"),
+    ],
+)
+st.altair_chart((nube + linea + punto_actual).properties(height=380), width="stretch")
+
+grafico = pd.DataFrame(
+    {
+        "Semana": [
+            "Hace 4 semanas", "Hace 3 semanas", "Hace 2 semanas",
+            "Última semana", "Semana siguiente",
+        ],
+        "Ventas registradas": [
+            ventas["ventas_t_3"], ventas["ventas_t_2"],
+            ventas["ventas_t_1"], ventas["ventas_t_0"], None,
+        ],
+        "Pronóstico": [None, None, None, None, unidades],
+    }
+)
+st.subheader("Ventas recientes y pronóstico")
+st.bar_chart(grafico.set_index("Semana"))
+st.caption(
+    "Es una estimación de ventas registradas, no una garantía. "
+    "El modelo no conoce precios futuros, promociones ni faltantes de inventario."
+)
 
 with st.expander("¿Cómo se obtuvo este modelo?"):
     st.write(
